@@ -11,6 +11,8 @@ category:            Web
 extra-source-files:
 - README.md
 
+ghc-options: -Wall
+
 dependencies:
   - base >= 4.7 && < 5
   - aeson
@@ -26,14 +28,25 @@ dependencies:
   - wai-extra
   - warp
 
+source-dirs:
+  - src
+
+library:
+  exposed-modules:
+    - Webby
+
 executables:
-  webby:
-    source-dirs:      src
+  webby-example:
+    source-dirs:      app
     main:             Main.hs
     dependencies:
       - conduit
+      - webby
 
 default-extensions:
+  - FlexibleInstances
+  - MultiParamTypeClasses
   - NoImplicitPrelude
   - OverloadedStrings
+  - ScopedTypeVariables
   - TupleSections

@@ -1,173 +1,91 @@
-{-# LANGUAGE FlexibleInstances          #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE MultiParamTypeClasses      #-}
-module Webby.Server
-  ( WebbyM
-  , Handler
-  , RoutePattern
-  , Routes
-
-  -- | Routing and handlers
-  , mkRoute
-  , post
-  , get
-  , put
-
-  -- | Captures
-  , captures
-  , getCapture
-
-  -- | Response modification
-  , setStatus
-  , addHeader
-  , setHeader
-  , json
-  , text
-  , streamResponse
-
-  -- | Top Level
-  , webbyApp
-
-  -- Application context
-  , HasWEnv(..)
-  , WEnv
-  , emptyWEnv
-  ) where
+module Webby.Server where
 
 
-import           Control.Monad.Reader (withReaderT)
 import qualified Data.Aeson           as A
 import qualified Data.Binary.Builder  as Bu
 import qualified Data.ByteString.Lazy as LB
 import qualified Data.Text            as T
-import qualified UnliftIO             as U
 import qualified UnliftIO.Concurrent  as Conc
 import qualified UnliftIO.Exception   as E
 
 import           WebbyPrelude
 
-data WEnv = WEnv { weResp     :: Conc.MVar WyResp
-                 , weCaptures :: [(Text, Text)]
-                 }
-emptyWEnv :: IO WEnv
-emptyWEnv = do rspVar <- Conc.newEmptyMVar
-               return $ WEnv rspVar []
+import           Webby.Types
 
-class HasWEnv a where
-    getWEnv :: a -> WEnv
-    setWEnv :: WEnv -> a -> a
+-- | Retrieve the app environment given to the application at
+-- initialization.
+getAppEnv :: WebbyM appEnv appEnv
+getAppEnv = asks weAppEnv
 
-data WyResp = WyResp { wrStatus    :: Status
-                     , wrHeaders   :: ResponseHeaders
-                     , wrRespData  :: Either StreamingBody Bu.Builder
-                     , wrResponded :: Bool
-                     }
+-- | Retrieve all path captures (TODO: extend?)
+captures :: WebbyM appEnv [(Text, Text)]
+captures = asks weCaptures
 
-defaultWyResp :: WyResp
-defaultWyResp = WyResp status200 [] (Right Bu.empty) False
-
-newtype WebbyM env a = WebbyM
-    { unWebbyM :: ReaderT env (ResourceT IO) a
-    }
-    deriving (Functor, Applicative, Monad, MonadIO, MonadReader env)
-
-instance U.MonadUnliftIO (WebbyM env) where
-    askUnliftIO = WebbyM $ ReaderT $
-                  \env -> U.withUnliftIO $
-                  \u -> return $
-                  U.UnliftIO (U.unliftIO u . flip runReaderT env . unWebbyM)
-
-
-runWebbyM :: HasWEnv env => env -> WebbyM env a -> IO a
-runWebbyM env = runResourceT . flip runReaderT env . unWebbyM
-
--- To be called before request processing begins. Set up default
--- status for the response in the vault
-newWEnv :: [(Text, Text)] -> IO WEnv
-newWEnv captures = do wVar <- Conc.newMVar defaultWyResp
-                      return $ WEnv wVar captures
-
-captures :: HasWEnv env => WebbyM env [(Text, Text)]
-captures = asks (weCaptures . getWEnv)
-
-getCapture :: HasWEnv env => Text -> WebbyM env (Maybe Text)
+-- | Retrieve a particular capture (TODO: extend?)
+getCapture :: Text -> WebbyM appEnv (Maybe Text)
 getCapture t = do cs <- captures
                   return $ fmap snd $ headMay $ filter ((== t) . fst) cs
 
-setStatus :: HasWEnv env => Status -> WebbyM env ()
+setStatus :: Status -> WebbyM appEnv ()
 setStatus st = do
-    wVar <- asks (weResp . getWEnv)
+    wVar <- asks weResp
     Conc.modifyMVar_ wVar $ \wr -> return $ wr { wrStatus = st}
 
-addHeader :: HasWEnv env => Header -> WebbyM env ()
+addHeader :: Header -> WebbyM appEnv ()
 addHeader h = do
-    wVar <- asks (weResp . getWEnv)
+    wVar <- asks weResp
     Conc.modifyMVar_ wVar $
         \wr -> do let hs = wrHeaders wr
                   return $ wr { wrHeaders = hs ++ [h] }
 
 -- similar to addHeader but replaces a header
-setHeader :: HasWEnv env => Header -> WebbyM env ()
+setHeader :: Header -> WebbyM appEnv ()
 setHeader (k, v) = do
-    wVar <- asks (weResp . getWEnv)
+    wVar <- asks weResp
     Conc.modifyMVar_ wVar $
         \wr -> do let hs = wrHeaders wr
                       ohs = filter ((/= k) . fst) hs
                   return $ wr { wrHeaders = ohs ++ [(k, v)] }
 
-text :: HasWEnv env => Text -> WebbyM env ()
+text :: Text -> WebbyM appEnv ()
 text t = do
     setHeader (hContentType, "text/plain; charset=utf-8")
-    wVar <- asks (weResp . getWEnv)
+    wVar <- asks weResp
     Conc.modifyMVar_ wVar $
         \wr -> return $ wr { wrRespData = Right $ Bu.fromByteString $
                                           encodeUtf8 t }
 
-json :: (HasWEnv env, A.ToJSON a) => a -> WebbyM env ()
+json :: A.ToJSON b => b -> WebbyM appEnv ()
 json j = do
     setHeader (hContentType, "application/json; charset=utf-8")
-    wVar <- asks (weResp . getWEnv)
+    wVar <- asks weResp
     Conc.modifyMVar_ wVar $
         \wr -> return $ wr { wrRespData = Right $ Bu.fromLazyByteString $
                                           A.encode j }
 
-
-streamResponse :: HasWEnv env => StreamingBody -> WebbyM env ()
-streamResponse s = do
-    wVar <- asks (weResp . getWEnv)
+stream :: StreamingBody -> WebbyM appEnv ()
+stream s = do
+    wVar <- asks weResp
     Conc.modifyMVar_ wVar $
         \wr -> return $ wr { wrRespData = Left s }
-
-data PathSegment = Literal Text
-                 | Capture Text
-                 deriving (Eq, Show)
-
--- A route pattern specifies a HTTP method and a list of path segments
--- that must match.
-data RoutePattern = RoutePattern Method [PathSegment]
-                  deriving (Eq, Show)
-
-type Handler env = Request -> WebbyM env ()
-
-type Routes env = [(RoutePattern, Handler env)]
-
-type Captures = [(Text, Text)]
-
-doesMatch :: [PathSegment] -> [Text] -> Maybe Captures
-doesMatch [] [] = Just []
-doesMatch [] _ = Nothing
-doesMatch _ [] = Nothing
-doesMatch (Literal t:xs) (y:ys) | t == y = doesMatch xs ys
-                                | otherwise = Nothing
-doesMatch (Capture t:xs) (y:ys) = let c = (t, y)
-                                  in fmap (c:) $ doesMatch xs ys
 
 matchPattern :: Request -> RoutePattern -> Maybe Captures
 matchPattern r (RoutePattern mthd ps)
     | requestMethod r == mthd = doesMatch ps (pathInfo r)
     | otherwise = Nothing
+  where
+    doesMatch :: [PathSegment] -> [Text] -> Maybe Captures
+    doesMatch [] [] = Just []
+    doesMatch [] _ = Nothing
+    doesMatch _ [] = Nothing
+    doesMatch (Literal t:xs) (y:ys) | t == y = doesMatch xs ys
+                                    | otherwise = Nothing
+    doesMatch (Capture t:xs) (y:ys) = let c = (t, y)
+                                      in fmap (c:) $ doesMatch xs ys
 
-matchRequest :: Request -> Routes env -> Maybe (Captures, Handler env)
+-- | TODO: Request matching is currently naive. It is not performant
+-- for a large number of routes.
+matchRequest :: Request -> Routes env -> Maybe (Captures, WebbyM env ())
 matchRequest req routes = do
     let rM = headMay $ filter (\(_, _, k) -> isJust k) $
              map (\(pat, h) -> (pat, h, matchPattern req pat)) routes
@@ -175,14 +93,22 @@ matchRequest req routes = do
     cs <- csM
     return (cs, h)
 
-webbyApp :: HasWEnv env => env -> Routes env -> Handler env -> Application
-webbyApp appEnv routes defaultHandler req respond = do
-    let (cs, handler) = fromMaybe ([], defaultHandler) $ matchRequest req routes
-    wEnv <- newWEnv cs
-    let appEnv' = setWEnv wEnv appEnv
-    E.handleAny (\e -> respond $ responseLBS status500 []
+errorResponse404 :: WebbyM appEnv ()
+errorResponse404 = setStatus status404
+
+-- | Use this function, to create a WAI application. It takes a
+-- user/application defined `appEnv` data type and a list of
+-- routes. If none of the requests match a request, a default 404
+-- response is returned.
+webbyApp :: appEnv -> Routes appEnv -> Application
+webbyApp appEnv routes req respond = do
+    let defaultHandler = errorResponse404
+        (cs, handler) = fromMaybe ([], defaultHandler) $ matchRequest req routes
+    wEnv <- do v <- Conc.newMVar defaultWyResp
+               return $ WEnv v cs req appEnv
+    E.handleAny (\_ -> respond $ responseLBS status500 []
                         "Something went wrong") $ do
-        runWebbyM appEnv' (handler req)
+        runWebbyM wEnv handler
         let wVar = weResp wEnv
         wr <- Conc.takeMVar wVar
         case wrRespData wr of
@@ -206,14 +132,23 @@ text2PathSegments path =
 
     in mkSegs $ fixPath $ T.splitOn "/" path
 
-mkRoute :: Method -> Text -> Handler env -> (RoutePattern, Handler env)
+-- | Create a route for a user-provided HTTP request method, pattern
+-- and handler function.
+mkRoute :: Method -> Text -> WebbyM appEnv ()
+        -> (RoutePattern, WebbyM appEnv ())
 mkRoute m p h = (RoutePattern m (text2PathSegments p), h)
 
-post :: Text -> Handler env -> (RoutePattern, Handler env)
+-- | Create a route for a POST request method, given the path pattern
+-- and handler.
+post :: Text -> WebbyM appEnv () -> (RoutePattern, WebbyM appEnv ())
 post = mkRoute methodPost
 
-get :: Text -> Handler env -> (RoutePattern, Handler env)
+-- | Create a route for a GET request method, given the path pattern
+-- and handler.
+get :: Text -> WebbyM appEnv () -> (RoutePattern, WebbyM appEnv ())
 get = mkRoute methodGet
 
-put :: Text -> Handler env -> (RoutePattern, Handler env)
+-- | Create a route for a PUT request method, given the path pattern
+-- and handler.
+put :: Text -> WebbyM appEnv () -> (RoutePattern, WebbyM appEnv ())
 put = mkRoute methodPut
